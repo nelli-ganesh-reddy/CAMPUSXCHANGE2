@@ -8,7 +8,7 @@ import mysql from 'mysql2/promise';
 import multer from 'multer';
 import nodemailer from 'nodemailer';
 import { v2 as cloudinary } from 'cloudinary';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHmac, randomInt } from 'node:crypto';
 
 const app = express();
 const port = Number(process.env.PORT || 4000);
@@ -30,6 +30,21 @@ app.use(cors({ origin: process.env.WEB_ORIGIN || 'http://localhost:5173' }));
 app.use(express.json({ limit: '1mb' }));
 app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, limit: 20 }));
 app.use('/api', rateLimit({ windowMs: 15 * 60 * 1000, limit: 200 }));
+const verificationLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  message: { error: 'Too many verification attempts. Wait 15 minutes and try again.' }
+});
+const resendCodeLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 3,
+  message: { error: 'Too many code requests. Wait 15 minutes and try again.' }
+});
+const contactMessageLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 5,
+  message: { error: 'Too many messages sent. Wait 15 minutes and try again.' }
+});
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -98,8 +113,9 @@ async function createDevelopmentTestUser() {
   else console.log('Development test user already exists; existing account was not changed.');
 }
 
-function hashToken(token) {
-  return createHash('sha256').update(token).digest('hex');
+function hashVerificationCode(email, code) {
+  if (!process.env.JWT_SECRET) throw new Error('JWT_SECRET is not configured');
+  return createHmac('sha256', process.env.JWT_SECRET).update(`${email}:${code}`).digest('hex');
 }
 
 function makeAuthToken(user) {
@@ -118,23 +134,25 @@ function requireAuth(req, res, next) {
   }
 }
 
-async function sendVerificationEmail(email, name, token) {
+async function sendVerificationEmail(email, name, code) {
   const requiredEmailSettings = ['SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASS', 'EMAIL_FROM'];
   const missingSettings = requiredEmailSettings.filter((setting) => !process.env[setting]);
   if (missingSettings.length) {
     throw new Error(`SMTP email is not configured. Set: ${missingSettings.join(', ')}.`);
   }
-  const verifyUrl = new URL(process.env.FRONTEND_URL || 'http://localhost:5173');
-  verifyUrl.searchParams.set('token', token);
   const subject = 'Verify your CampusXchange email';
-  const html = `<p>Hi ${escapeHtml(name)},</p><p>Confirm your NITW student email to activate your CampusXchange account.</p><p><a href="${escapeHtml(verifyUrl.toString())}">Verify my email</a></p><p>This link expires in 30 minutes. If you did not request this, you can ignore this message.</p>`;
-  const transporter = nodemailer.createTransport({
+  const html = `<p>Hi ${escapeHtml(name)},</p><p>Enter this code in CampusXchange to verify your NITW student email:</p><p style="font-size:28px;font-weight:bold;letter-spacing:6px">${code}</p><p>This code expires in 10 minutes. If you did not request this, you can ignore this message.</p>`;
+  const transporter = createEmailTransporter();
+  await transporter.sendMail({ from: process.env.EMAIL_FROM, to: email, subject, html });
+}
+
+function createEmailTransporter() {
+  return nodemailer.createTransport({
     host: process.env.SMTP_HOST,
     port: Number(process.env.SMTP_PORT),
     secure: process.env.SMTP_SECURE === 'true',
     auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
   });
-  await transporter.sendMail({ from: process.env.EMAIL_FROM, to: email, subject, html });
 }
 
 function escapeHtml(value) {
@@ -155,29 +173,56 @@ app.post('/api/auth/register', asyncRoute(async (req, res) => {
   const [existing] = await pool.execute('SELECT id FROM users WHERE email = ?', [email]);
   if (existing.length) return res.status(409).json({ error: 'An account already uses this email. Try signing in.' });
 
-  const token = randomBytes(32).toString('hex');
+  const code = String(randomInt(100000, 1000000));
   const [result] = await pool.execute(
-    'INSERT INTO users (name, email, password_hash, verification_hash, verification_expires) VALUES (?, ?, ?, ?, DATE_ADD(UTC_TIMESTAMP(), INTERVAL 30 MINUTE))',
-    [name, email, await bcrypt.hash(password, 12), hashToken(token)]
+    'INSERT INTO users (name, email, password_hash, verification_hash, verification_expires) VALUES (?, ?, ?, ?, DATE_ADD(UTC_TIMESTAMP(), INTERVAL 10 MINUTE))',
+    [name, email, await bcrypt.hash(password, 12), hashVerificationCode(email, code)]
   );
   try {
-    await sendVerificationEmail(email, name, token);
+    await sendVerificationEmail(email, name, code);
   } catch (error) {
     await pool.execute('DELETE FROM users WHERE id = ?', [result.insertId]);
     throw error;
   }
-  res.status(201).json({ message: 'Check your NITW inbox for a verification link. It expires in 30 minutes.' });
+  res.status(201).json({ message: 'A 6-digit code has been sent to your NITW inbox. It expires in 10 minutes.' });
 }));
 
-app.post('/api/auth/verify', asyncRoute(async (req, res) => {
-  const token = String(req.body.token || '');
-  if (!/^[a-f0-9]{64}$/i.test(token)) return res.status(400).json({ error: 'This verification link is invalid or expired.' });
-  const [result] = await pool.execute(
-    'UPDATE users SET verified_at = UTC_TIMESTAMP(), verification_hash = NULL, verification_expires = NULL WHERE verification_hash = ? AND verification_expires > UTC_TIMESTAMP()',
-    [hashToken(token)]
+app.post('/api/auth/verify', verificationLimiter, asyncRoute(async (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const code = String(req.body.code || '').trim();
+  if (!emailPattern.test(email)) return res.status(400).json({ error: 'Use your NITW student email ending in @student.nitw.ac.in.' });
+  if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: 'Enter the 6-digit code from your email.' });
+  const codeHash = hashVerificationCode(email, code);
+  const [users] = await pool.execute(
+    'SELECT id FROM users WHERE email = ? AND verified_at IS NULL AND verification_hash = ? AND verification_expires > UTC_TIMESTAMP()',
+    [email, codeHash]
   );
-  if (!result.affectedRows) return res.status(400).json({ error: 'This verification link is invalid or expired. Please register again.' });
+  if (!users.length) return res.status(400).json({ error: 'That code is incorrect or expired. Request a new code and try again.' });
+  const [result] = await pool.execute(
+    'UPDATE users SET verified_at = UTC_TIMESTAMP(), verification_hash = NULL, verification_expires = NULL WHERE id = ? AND verified_at IS NULL AND verification_hash = ? AND verification_expires > UTC_TIMESTAMP()',
+    [users[0].id, codeHash]
+  );
+  if (!result.affectedRows) return res.status(400).json({ error: 'That code is incorrect or expired. Request a new code and try again.' });
   res.json({ message: 'Email verified. You can now sign in.' });
+}));
+
+app.post('/api/auth/resend-code', resendCodeLimiter, asyncRoute(async (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  if (!emailPattern.test(email)) return res.status(400).json({ error: 'Use your NITW student email ending in @student.nitw.ac.in.' });
+  const [users] = await pool.execute(
+    'SELECT id, name FROM users WHERE email = ? AND verified_at IS NULL',
+    [email]
+  );
+  if (users.length) {
+    const user = users[0];
+    const code = String(randomInt(100000, 1000000));
+    await pool.execute(
+      'UPDATE users SET verification_hash = ?, verification_expires = DATE_ADD(UTC_TIMESTAMP(), INTERVAL 10 MINUTE) WHERE id = ? AND verified_at IS NULL',
+      [hashVerificationCode(email, code), user.id]
+    );
+    await sendVerificationEmail(email, user.name, code);
+  }
+  res.json({ message: 'If that email has an unverified account, a new code has been sent.' });
 }));
 
 app.post('/api/auth/login', asyncRoute(async (req, res) => {
@@ -187,7 +232,7 @@ app.post('/api/auth/login', asyncRoute(async (req, res) => {
   const [rows] = await pool.execute('SELECT id, name, email, password_hash, verified_at FROM users WHERE email = ?', [email]);
   const user = rows[0];
   if (!user || !(await bcrypt.compare(password, user.password_hash))) return res.status(401).json({ error: 'Email or password is incorrect.' });
-  if (!user.verified_at) return res.status(403).json({ error: 'Verify your email from the link sent to your inbox before signing in.' });
+  if (!user.verified_at) return res.status(403).json({ error: 'Verify your email with the code sent to your inbox before signing in.' });
   res.json({ token: makeAuthToken(user), user: { id: user.id, name: user.name, email: user.email } });
 }));
 
@@ -232,6 +277,36 @@ app.get('/api/posts/:id/contact', requireAuth, asyncRoute(async (req, res) => {
     return res.json({ sellerName: post.sellerName, isOwner: true });
   }
   res.json({ sellerName: post.sellerName, contactEmail: post.sellerEmail, isOwner: false });
+}));
+
+app.post('/api/posts/:id/contact-message', requireAuth, contactMessageLimiter, asyncRoute(async (req, res) => {
+  const message = String(req.body.message || '').trim();
+  if (message.length < 10 || message.length > 2000) {
+    return res.status(400).json({ error: 'Write a message between 10 and 2,000 characters.' });
+  }
+  const [rows] = await pool.execute(
+    `SELECT p.user_id AS userId, p.title, p.status, u.email AS sellerEmail
+     FROM posts p JOIN users u ON u.id = p.user_id WHERE p.id = ?`,
+    [req.params.id]
+  );
+  const post = rows[0];
+  if (!post || post.status !== 'active') return res.status(404).json({ error: 'This post is no longer available.' });
+  if (String(post.userId) === String(req.user.sub)) return res.status(400).json({ error: 'You cannot message yourself about your own post.' });
+  const safeMessage = escapeHtml(message).replace(/\n/g, '<br>');
+  try {
+    await createEmailTransporter().sendMail({
+      from: process.env.EMAIL_FROM,
+      to: post.sellerEmail,
+      replyTo: { name: req.user.name, address: req.user.email },
+      subject: `CampusXchange inquiry: ${post.title}`,
+      text: `${req.user.name} (${req.user.email}) sent a message about "${post.title}":\n\n${message}`,
+      html: `<p><strong>${escapeHtml(req.user.name)}</strong> (${escapeHtml(req.user.email)}) sent you a message about <strong>${escapeHtml(post.title)}</strong>:</p><p>${safeMessage}</p><p>Reply to this email to contact the student.</p>`
+    });
+  } catch (error) {
+    console.error('Could not send post contact message:', error?.responseCode || error?.code || 'email provider error');
+    return res.status(502).json({ error: 'Message could not be sent right now. Please try again later.' });
+  }
+  res.json({ message: 'Your message has been sent to the poster. They can reply directly to you.' });
 }));
 
 app.post('/api/posts', requireAuth, asyncRoute(async (req, res) => {

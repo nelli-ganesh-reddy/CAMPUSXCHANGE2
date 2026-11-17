@@ -76,20 +76,6 @@ function App() {
     const timer = setTimeout(() => loadPosts(), 250);
     return () => clearTimeout(timer);
   }, [query]);
-  useEffect(() => {
-    const currentUrl = new URL(window.location.href);
-    const verificationToken = currentUrl.searchParams.get('token');
-    if (verificationToken) {
-      api('/auth/verify', { method: 'POST', body: JSON.stringify({ token: verificationToken }) })
-        .then((data) => {
-          setNotice(data.message);
-          currentUrl.searchParams.delete('token');
-          window.history.replaceState({}, '', `${currentUrl.pathname}${currentUrl.search}${currentUrl.hash}`);
-        })
-        .catch((err) => setError(err.message));
-    }
-  }, []);
-
   function signOut() {
     localStorage.removeItem(tokenKey);
     localStorage.removeItem('cx_user');
@@ -197,7 +183,11 @@ function App() {
       </main>
       <footer><a className="brand footer-brand" href="#"><span className="brand-mark"><ArrowDownUp size={16} /></span><span>campus<span className="brand-light">xchange</span></span></a><span>Made for campus life at NIT Warangal</span><a href="mailto:campusxchange@example.com"><CircleHelp size={15} /> Need help?</a></footer>
 
-      {detailPost && <PostDetailModal post={detailPost} contactInfo={contactInfo} loading={contactLoading} error={contactError} signedIn={Boolean(user)} onClose={() => setDetailPost(null)} onSignIn={() => setModal('auth')} onCopy={async (email) => {
+      {detailPost && <PostDetailModal post={detailPost} contactInfo={contactInfo} loading={contactLoading} error={contactError} signedIn={Boolean(user)} onClose={() => setDetailPost(null)} onSignIn={() => setModal('auth')} onSendMessage={async (postId, message) => {
+        const data = await api(`/posts/${postId}/contact-message`, { method: 'POST', body: JSON.stringify({ message }) });
+        setNotice(data.message);
+        return data;
+      }} onCopy={async (email) => {
         try { await navigator.clipboard.writeText(email); setNotice('Contact email copied.'); }
         catch { setError('Could not copy the email. You can select and copy it manually.'); }
       }} />}
@@ -231,9 +221,29 @@ function PostCard({ post, own, onOpen, onStatus, onDelete, onEdit }) {
   </article>;
 }
 
-function PostDetailModal({ post, contactInfo, loading, error, signedIn, onClose, onSignIn, onCopy }) {
+function PostDetailModal({ post, contactInfo, loading, error, signedIn, onClose, onSignIn, onCopy, onSendMessage }) {
+  const [message, setMessage] = useState('');
+  const [sending, setSending] = useState(false);
+  const [sent, setSent] = useState(false);
+  const [sendError, setSendError] = useState('');
   const lostFound = post.module === 'lost_found';
   const typeLabel = post.type === 'sell' ? 'FOR SALE' : post.type === 'exchange' ? 'FOR EXCHANGE' : post.type === 'free' ? 'GIVING AWAY' : post.type === 'lost' ? 'LOST' : 'FOUND';
+
+  async function submitMessage(event) {
+    event.preventDefault();
+    setSending(true);
+    setSendError('');
+    try {
+      await onSendMessage(post.id, message);
+      setSent(true);
+      setMessage('');
+    } catch (submitError) {
+      setSendError(submitError.message);
+    } finally {
+      setSending(false);
+    }
+  }
+
   return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
     <section className="modal detail-modal" role="dialog" aria-modal="true" aria-labelledby="detail-title">
       <button className="modal-close" onClick={onClose} aria-label="Close"><X size={19} /></button>
@@ -255,7 +265,15 @@ function PostDetailModal({ post, contactInfo, loading, error, signedIn, onClose,
           : loading ? <div className="contact-state">Loading contact details...</div>
             : error ? <div className="contact-state contact-error">{error}</div>
               : contactInfo?.isOwner ? <div className="contact-state">This is your post.</div>
-                : contactInfo?.contactEmail ? <div className="contact-actions"><a className="button button-dark" href={`mailto:${contactInfo.contactEmail}?subject=${encodeURIComponent(`CampusXchange: ${post.title}`)}`}><Mail size={15} /> Email poster</a><button className="button button-outline" onClick={() => onCopy(contactInfo.contactEmail)}><Copy size={15} /> Copy email</button></div>
+              : contactInfo?.contactEmail ? <>
+                {sent ? <div className="notice contact-sent"><Check size={16} /> Message sent; the poster can reply to your student email.</div> : <form className="contact-message-form" onSubmit={submitMessage}>
+                  <label htmlFor="poster-message">Your message</label>
+                  <textarea id="poster-message" minLength="10" maxLength="2000" required rows="3" placeholder="Ask a question or arrange a campus meetup..." value={message} onChange={(event) => setMessage(event.target.value)} />
+                  {sendError && <div className="contact-state contact-error" role="alert">{sendError}</div>}
+                  <button className="button button-dark contact-button" disabled={sending || message.trim().length < 10}>{sending ? 'Sending...' : 'Send message to poster'} <ArrowRight size={15} /></button>
+                </form>}
+                <div className="contact-actions"><button className="button button-outline" onClick={() => onCopy(contactInfo.contactEmail)}><Copy size={15} /> Copy poster email</button></div>
+              </>
                   : <div className="contact-state">Contact details are unavailable.</div>}
       </div>
       <p className="detail-safety"><ShieldCheck size={14} /> For safety, meet in a public place on campus.</p>
@@ -269,27 +287,58 @@ function AuthModal({ onClose, api, onSuccess }) {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  const [verificationPending, setVerificationPending] = useState(false);
+  const [code, setCode] = useState('');
+
   async function submit(event) {
     event.preventDefault(); setBusy(true); setError(''); setMessage('');
     try {
       const data = await api(`/auth/${mode === 'signup' ? 'register' : 'login'}`, { method: 'POST', body: JSON.stringify(form) });
-      if (mode === 'signup') setMessage(data.message); else onSuccess(data);
+      if (mode === 'signup') {
+        setVerificationPending(true);
+        setMessage(data.message);
+      } else onSuccess(data);
     } catch (err) { setError(err.message); } finally { setBusy(false); }
   }
+
+  async function verifyCode(event) {
+    event.preventDefault(); setBusy(true); setError('');
+    try {
+      const data = await api('/auth/verify', { method: 'POST', body: JSON.stringify({ email: form.email, code }) });
+      setVerificationPending(false);
+      setCode('');
+      setMode('login');
+      setForm((current) => ({ ...current, password: '' }));
+      setMessage(data.message);
+    } catch (err) { setError(err.message); } finally { setBusy(false); }
+  }
+
+  async function resendCode() {
+    setBusy(true); setError(''); setMessage('');
+    try {
+      const data = await api('/auth/resend-code', { method: 'POST', body: JSON.stringify({ email: form.email }) });
+      setMessage(data.message);
+    } catch (err) { setError(err.message); } finally { setBusy(false); }
+  }
+
   return <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
     <section className="modal auth-modal" role="dialog" aria-modal="true" aria-labelledby="auth-title">
       <button className="modal-close" onClick={onClose} aria-label="Close"><X size={19} /></button>
       <span className="modal-logo"><ArrowDownUp size={20} /></span><div className="section-kicker">WELCOME TO CAMPUSXCHANGE</div>
       <h2 id="auth-title">{mode === 'login' ? 'Good to see you again.' : 'Join your campus community.'}</h2>
       <p className="modal-subtitle">{mode === 'login' ? 'Sign in with your verified NITW student email.' : 'A place for NITW students to find, share, and reconnect.'}</p>
-      <div className="auth-switch"><button className={mode === 'login' ? 'on' : ''} onClick={() => { setMode('login'); setMessage(''); setError(''); }}>Sign in</button><button className={mode === 'signup' ? 'on' : ''} onClick={() => { setMode('signup'); setMessage(''); setError(''); }}>Create account</button></div>
+      {!verificationPending && <div className="auth-switch"><button className={mode === 'login' ? 'on' : ''} onClick={() => { setMode('login'); setMessage(''); setError(''); }}>Sign in</button><button className={mode === 'signup' ? 'on' : ''} onClick={() => { setMode('signup'); setMessage(''); setError(''); }}>Create account</button></div>}
       {message && <div className="notice auth-message"><Check size={16} /> {message}</div>}
       {error && <div className="error-banner" role="alert">{error}</div>}
-      {!message && <form onSubmit={submit} className="form-stack">
+      {verificationPending ? <form onSubmit={verifyCode} className="form-stack">
+        <label>6-digit email code<input autoComplete="one-time-code" inputMode="numeric" pattern="[0-9]{6}" maxLength="6" required placeholder="Enter your code" value={code} onChange={(e) => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))} /></label>
+        <button className="button button-dark submit-button" disabled={busy || code.length !== 6}>{busy ? 'Please wait...' : 'Verify email'} <ArrowRight size={16} /></button>
+        <button type="button" className="resend-code" disabled={busy} onClick={resendCode}>Didn’t get a code? Send a new one</button>
+      </form> : !message && <form onSubmit={submit} className="form-stack">
         {mode === 'signup' && <label>Your name<input autoComplete="name" required minLength="2" maxLength="100" placeholder="e.g. Ananya Rao" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></label>}
         <label>NITW student email<input autoComplete="email" type="email" required placeholder="name@student.nitw.ac.in" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} /></label>
         <label>Password<input autoComplete={mode === 'login' ? 'current-password' : 'new-password'} type="password" minLength="8" required placeholder="At least 8 characters" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} /></label>
-        {mode === 'signup' && <div className="domain-hint"><ShieldCheck size={15} /> Verification link will be sent to your student inbox.</div>}
+        {mode === 'signup' && <div className="domain-hint"><ShieldCheck size={15} /> A 6-digit code will be sent to your student inbox.</div>}
         <button className="button button-dark submit-button" disabled={busy}>{busy ? 'Please wait...' : mode === 'login' ? 'Sign in' : 'Create my account'} <ArrowRight size={16} /></button>
       </form>}
       <div className="modal-footnote"><LockKeyhole size={13} /> Your student email stays private.</div>

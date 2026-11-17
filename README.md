@@ -9,9 +9,9 @@ CampusXchange is a campus-only marketplace and Lost & Found website. Students ca
 - **Image storage**: use Cloudinary. Set `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, and `CLOUDINARY_API_SECRET`.
 - **Authentication**: the server creates its own `JWT_SECRET`; set a long random value in production.
 
-No payment provider or Google OAuth credentials are needed. Email verification is a one-time link sent to the student's institutional mailbox.
+No payment provider or Google OAuth credentials are needed. Email verification uses a six-digit one-time code sent to the student's institutional mailbox. Codes expire after 10 minutes; students can request a replacement code from the sign-up screen.
 
-Listing cards open a detail view. Signed-in students can email the poster from there; poster email addresses are only returned by the authenticated contact endpoint and are not included in public listing results. Meet in a public place on campus.
+Listing cards open a detail view. Signed-in students can message the poster through the app; the message is delivered by the app's SMTP account and replies go to the sender's student email. Poster email addresses are only returned by the authenticated contact endpoint and are not included in public listing results. Contact messages are rate-limited. Meet in a public place on campus.
 
 ## Run locally
 
@@ -20,7 +20,7 @@ Requirements: Node.js 20+ and a MySQL database.
 1. Copy `server/.env.example` to `server/.env` and fill in the database, Gmail SMTP, and Cloudinary values.
 2. Leave `VITE_API_URL` empty in `client/.env` for local development; Vite proxies `/api` requests to the local backend. From the project root run `npm install` (it installs both frontend and backend workspaces).
 3. Run `npm run dev`. The web app is at `http://localhost:5173`; the API is at `http://localhost:4000`.
-4. Register using an `@student.nitw.ac.in` email and click the link sent to that inbox.
+4. Register using an `@student.nitw.ac.in` email, enter the six-digit code sent to that inbox, and then sign in.
 
 The API creates its tables on startup. Keep `.env` files and all provider credentials out of Git.
 
@@ -30,9 +30,8 @@ For local feature testing without waiting for email verification, an opt-in veri
 
 GitHub is not automatically a host for the full application. GitHub Pages can serve the static frontend, but the Express API still needs a public Node.js host (for example, Render or Railway), plus the managed MySQL database and Cloudinary.
 
-- Deploy `server/` as a Node.js web service. Configure the variables from `server/.env.example`; set `FRONTEND_URL` to the complete public frontend URL, including the repository subpath and trailing slash if applicable (for example, `https://OWNER.github.io/CAMPUSXCHANGE2/`), and set `WEB_ORIGIN` to the origin only (for example, `https://OWNER.github.io`).
+- Deploy `server/` as a Node.js web service and configure the variables from `server/.env.example`. Set `WEB_ORIGIN` to the frontend origin (for example, `https://OWNER.github.io`).
 - For GitHub Pages, build the Vite frontend with `VITE_API_URL` set to the public API origin (for example, `https://your-api.example.com`, without a trailing slash) and `VITE_BASE_PATH=/CAMPUSXCHANGE2/`. Replace the repository name in the base path if needed. The Pages site URL is normally `https://OWNER.github.io/CAMPUSXCHANGE2/`.
-- The email verification link returns to the frontend URL with a `?token=...` query parameter; it does not depend on a `/verify` route, so it works with GitHub Pages repository paths.
 - Provision MySQL and Cloudinary, set all deployment secrets in the hosting providers’ environment settings, and test email delivery before accepting real users.
 
 ## Scope and safety
