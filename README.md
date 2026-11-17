@@ -11,6 +11,8 @@ CampusXchange is a campus-only marketplace and Lost & Found website. Students ca
 
 No payment provider or Google OAuth credentials are needed. Email verification uses a six-digit one-time code sent to the student's institutional mailbox. Codes expire after 10 minutes; students can request a replacement code from the sign-up screen.
 
+Students who forget their password can request a separate six-digit reset code by email. Reset codes expire after 10 minutes, are single-use, and have rate-limited requests and attempts. Reset requests do not reveal whether an account exists.
+
 Listing cards open a detail view. Signed-in students can message the poster through the app; the message is delivered by the app's SMTP account and replies go to the sender's student email. Poster email addresses are only returned by the authenticated contact endpoint and are not included in public listing results. Contact messages are rate-limited. Meet in a public place on campus.
 
 ## Run locally

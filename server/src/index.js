@@ -8,7 +8,7 @@ import mysql from 'mysql2/promise';
 import multer from 'multer';
 import nodemailer from 'nodemailer';
 import { v2 as cloudinary } from 'cloudinary';
-import { createHmac, randomInt } from 'node:crypto';
+import { createHmac, randomInt, timingSafeEqual } from 'node:crypto';
 
 const app = express();
 const port = Number(process.env.PORT || 4000);
@@ -24,6 +24,16 @@ const pool = mysql.createPool({
   waitForConnections: true,
   connectionLimit: 10,
   decimalNumbers: true
+});
+const passwordResetRequestLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 3,
+  message: { error: 'Too many password reset requests. Wait 15 minutes and try again.' }
+});
+const passwordResetLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  message: { error: 'Too many password reset attempts. Wait 15 minutes and try again.' }
 });
 
 app.use(cors({ origin: process.env.WEB_ORIGIN || 'http://localhost:5173' }));
@@ -88,6 +98,15 @@ async function initializeDatabase() {
       INDEX idx_posts_user (user_id)
     )
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS password_reset_codes (
+      email VARCHAR(254) NOT NULL PRIMARY KEY,
+      code_hash CHAR(64) NOT NULL,
+      expires_at DATETIME NOT NULL,
+      attempts TINYINT UNSIGNED NOT NULL DEFAULT 0,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )
+  `);
   await createDevelopmentTestUser();
 }
 
@@ -113,9 +132,10 @@ async function createDevelopmentTestUser() {
   else console.log('Development test user already exists; existing account was not changed.');
 }
 
-function hashVerificationCode(email, code) {
+function hashVerificationCode(email, code, purpose = 'verification') {
   if (!process.env.JWT_SECRET) throw new Error('JWT_SECRET is not configured');
-  return createHmac('sha256', process.env.JWT_SECRET).update(`${email}:${code}`).digest('hex');
+  const message = purpose === 'verification' ? `${email}:${code}` : `${purpose}:${email}:${code}`;
+  return createHmac('sha256', process.env.JWT_SECRET).update(message).digest('hex');
 }
 
 function makeAuthToken(user) {
@@ -134,14 +154,16 @@ function requireAuth(req, res, next) {
   }
 }
 
-async function sendVerificationEmail(email, name, code) {
+async function sendOneTimeCode(email, name, code, purpose = 'verification') {
   const requiredEmailSettings = ['SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASS', 'EMAIL_FROM'];
   const missingSettings = requiredEmailSettings.filter((setting) => !process.env[setting]);
   if (missingSettings.length) {
     throw new Error(`SMTP email is not configured. Set: ${missingSettings.join(', ')}.`);
   }
-  const subject = 'Verify your CampusXchange email';
-  const html = `<p>Hi ${escapeHtml(name)},</p><p>Enter this code in CampusXchange to verify your NITW student email:</p><p style="font-size:28px;font-weight:bold;letter-spacing:6px">${code}</p><p>This code expires in 10 minutes. If you did not request this, you can ignore this message.</p>`;
+  const isPasswordReset = purpose === 'password-reset';
+  const subject = isPasswordReset ? 'Reset your CampusXchange password' : 'Verify your CampusXchange email';
+  const action = isPasswordReset ? 'reset your CampusXchange password' : 'verify your NITW student email';
+  const html = `<p>Hi ${escapeHtml(name)},</p><p>Enter this code in CampusXchange to ${action}:</p><p style="font-size:28px;font-weight:bold;letter-spacing:6px">${code}</p><p>This code expires in 10 minutes. If you did not request this, you can ignore this message.</p>`;
   const transporter = createEmailTransporter();
   await transporter.sendMail({ from: process.env.EMAIL_FROM, to: email, subject, html });
 }
@@ -179,7 +201,7 @@ app.post('/api/auth/register', asyncRoute(async (req, res) => {
     [name, email, await bcrypt.hash(password, 12), hashVerificationCode(email, code)]
   );
   try {
-    await sendVerificationEmail(email, name, code);
+    await sendOneTimeCode(email, name, code);
   } catch (error) {
     await pool.execute('DELETE FROM users WHERE id = ?', [result.insertId]);
     throw error;
@@ -220,9 +242,94 @@ app.post('/api/auth/resend-code', resendCodeLimiter, asyncRoute(async (req, res)
       'UPDATE users SET verification_hash = ?, verification_expires = DATE_ADD(UTC_TIMESTAMP(), INTERVAL 10 MINUTE) WHERE id = ? AND verified_at IS NULL',
       [hashVerificationCode(email, code), user.id]
     );
-    await sendVerificationEmail(email, user.name, code);
+    await sendOneTimeCode(email, user.name, code);
   }
   res.json({ message: 'If that email has an unverified account, a new code has been sent.' });
+}));
+
+app.post('/api/auth/forgot-password', passwordResetRequestLimiter, asyncRoute(async (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  if (!emailPattern.test(email)) return res.status(400).json({ error: 'Use your NITW student email ending in @student.nitw.ac.in.' });
+  const [users] = await pool.execute(
+    'SELECT name FROM users WHERE email = ? AND verified_at IS NOT NULL',
+    [email]
+  );
+  if (users.length) {
+    const code = String(randomInt(100000, 1000000));
+    await pool.execute(
+      `INSERT INTO password_reset_codes (email, code_hash, expires_at, attempts)
+       VALUES (?, ?, DATE_ADD(UTC_TIMESTAMP(), INTERVAL 10 MINUTE), 0)
+       ON DUPLICATE KEY UPDATE code_hash = VALUES(code_hash), expires_at = VALUES(expires_at), attempts = 0`,
+      [email, hashVerificationCode(email, code, 'password-reset')]
+    );
+    try {
+      await sendOneTimeCode(email, users[0].name, code, 'password-reset');
+    } catch (error) {
+      await pool.execute('DELETE FROM password_reset_codes WHERE email = ?', [email]);
+      console.error('Password reset email delivery failed:', error?.responseCode || error?.code || 'email provider error');
+    }
+  }
+  res.json({ message: 'If a verified account exists for that email, a password reset code has been sent.' });
+}));
+
+app.post('/api/auth/reset-password', passwordResetLimiter, asyncRoute(async (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const code = String(req.body.code || '').trim();
+  const password = String(req.body.password || '');
+  if (!emailPattern.test(email)) return res.status(400).json({ error: 'Use your NITW student email ending in @student.nitw.ac.in.' });
+  if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: 'Enter the 6-digit code from your email.' });
+  if (password.length < 8) return res.status(400).json({ error: 'Choose a password with at least 8 characters.' });
+
+  const connection = await pool.getConnection();
+  let invalidCode = false;
+  let accountMissing = false;
+  try {
+    await connection.beginTransaction();
+    const [resetRows] = await connection.execute(
+      'SELECT code_hash, attempts FROM password_reset_codes WHERE email = ? AND expires_at > UTC_TIMESTAMP() FOR UPDATE',
+      [email]
+    );
+    const reset = resetRows[0];
+    if (!reset || reset.attempts >= 5) {
+      await connection.execute('DELETE FROM password_reset_codes WHERE email = ?', [email]);
+      accountMissing = !reset;
+      invalidCode = Boolean(reset);
+      await connection.commit();
+    } else {
+      const expected = Buffer.from(reset.code_hash, 'hex');
+      const provided = Buffer.from(hashVerificationCode(email, code, 'password-reset'), 'hex');
+      const matches = expected.length === provided.length && timingSafeEqual(expected, provided);
+      if (!matches) {
+        if (reset.attempts + 1 >= 5) {
+          await connection.execute('DELETE FROM password_reset_codes WHERE email = ?', [email]);
+        } else {
+          await connection.execute('UPDATE password_reset_codes SET attempts = attempts + 1 WHERE email = ?', [email]);
+        }
+        invalidCode = true;
+        await connection.commit();
+      } else {
+        const [result] = await connection.execute(
+          'UPDATE users SET password_hash = ? WHERE email = ? AND verified_at IS NOT NULL',
+          [await bcrypt.hash(password, 12), email]
+        );
+        if (!result.affectedRows) {
+          await connection.execute('DELETE FROM password_reset_codes WHERE email = ?', [email]);
+          accountMissing = true;
+          await connection.commit();
+        } else {
+          await connection.execute('DELETE FROM password_reset_codes WHERE email = ?', [email]);
+          await connection.commit();
+        }
+      }
+    }
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+  if (invalidCode || accountMissing) return res.status(400).json({ error: 'That code is incorrect or expired. Request a new code and try again.' });
+  res.json({ message: 'Your password has been reset. You can now sign in.' });
 }));
 
 app.post('/api/auth/login', asyncRoute(async (req, res) => {

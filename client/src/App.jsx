@@ -289,6 +289,10 @@ function AuthModal({ onClose, api, onSuccess }) {
   const [error, setError] = useState('');
   const [verificationPending, setVerificationPending] = useState(false);
   const [code, setCode] = useState('');
+  const [forgotMode, setForgotMode] = useState(false);
+  const [resetCodeSent, setResetCodeSent] = useState(false);
+  const [resetCode, setResetCode] = useState('');
+  const [newPassword, setNewPassword] = useState('');
 
   async function submit(event) {
     event.preventDefault(); setBusy(true); setError(''); setMessage('');
@@ -321,26 +325,62 @@ function AuthModal({ onClose, api, onSuccess }) {
     } catch (err) { setError(err.message); } finally { setBusy(false); }
   }
 
+  async function requestPasswordReset() {
+    setBusy(true); setError(''); setMessage('');
+    try {
+      const data = await api('/auth/forgot-password', { method: 'POST', body: JSON.stringify({ email: form.email }) });
+      setResetCodeSent(true);
+      setMessage(data.message);
+    } catch (err) { setError(err.message); } finally { setBusy(false); }
+  }
+
+  async function resetPassword(event) {
+    event.preventDefault(); setBusy(true); setError(''); setMessage('');
+    try {
+      const data = await api('/auth/reset-password', { method: 'POST', body: JSON.stringify({ email: form.email, code: resetCode, password: newPassword }) });
+      setForgotMode(false);
+      setResetCodeSent(false);
+      setResetCode('');
+      setNewPassword('');
+      setMode('login');
+      setForm((current) => ({ ...current, password: '' }));
+      setMessage(data.message);
+    } catch (err) { setError(err.message); } finally { setBusy(false); }
+  }
+
   return <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
     <section className="modal auth-modal" role="dialog" aria-modal="true" aria-labelledby="auth-title">
       <button className="modal-close" onClick={onClose} aria-label="Close"><X size={19} /></button>
       <span className="modal-logo"><ArrowDownUp size={20} /></span><div className="section-kicker">WELCOME TO CAMPUSXCHANGE</div>
-      <h2 id="auth-title">{mode === 'login' ? 'Good to see you again.' : 'Join your campus community.'}</h2>
-      <p className="modal-subtitle">{mode === 'login' ? 'Sign in with your verified NITW student email.' : 'A place for NITW students to find, share, and reconnect.'}</p>
-      {!verificationPending && <div className="auth-switch"><button className={mode === 'login' ? 'on' : ''} onClick={() => { setMode('login'); setMessage(''); setError(''); }}>Sign in</button><button className={mode === 'signup' ? 'on' : ''} onClick={() => { setMode('signup'); setMessage(''); setError(''); }}>Create account</button></div>}
+      <h2 id="auth-title">{forgotMode ? 'Reset your password.' : mode === 'login' ? 'Good to see you again.' : 'Join your campus community.'}</h2>
+      <p className="modal-subtitle">{forgotMode ? 'We’ll email a one-time code to your NITW student inbox.' : mode === 'login' ? 'Sign in with your verified NITW student email.' : 'A place for NITW students to find, share, and reconnect.'}</p>
+      {!verificationPending && !forgotMode && <div className="auth-switch"><button className={mode === 'login' ? 'on' : ''} onClick={() => { setMode('login'); setMessage(''); setError(''); }}>Sign in</button><button className={mode === 'signup' ? 'on' : ''} onClick={() => { setMode('signup'); setMessage(''); setError(''); }}>Create account</button></div>}
       {message && <div className="notice auth-message"><Check size={16} /> {message}</div>}
       {error && <div className="error-banner" role="alert">{error}</div>}
       {verificationPending ? <form onSubmit={verifyCode} className="form-stack">
         <label>6-digit email code<input autoComplete="one-time-code" inputMode="numeric" pattern="[0-9]{6}" maxLength="6" required placeholder="Enter your code" value={code} onChange={(e) => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))} /></label>
         <button className="button button-dark submit-button" disabled={busy || code.length !== 6}>{busy ? 'Please wait...' : 'Verify email'} <ArrowRight size={16} /></button>
         <button type="button" className="resend-code" disabled={busy} onClick={resendCode}>Didn’t get a code? Send a new one</button>
+      </form> : forgotMode ? resetCodeSent ? <form onSubmit={resetPassword} className="form-stack">
+        <label>NITW student email<input type="email" value={form.email} readOnly /></label>
+        <label>6-digit reset code<input autoComplete="one-time-code" inputMode="numeric" pattern="[0-9]{6}" maxLength="6" required placeholder="Enter your reset code" value={resetCode} onChange={(e) => setResetCode(e.target.value.replace(/\D/g, '').slice(0, 6))} /></label>
+        <label>New password<input autoComplete="new-password" type="password" minLength="8" required placeholder="At least 8 characters" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} /></label>
+        <button className="button button-dark submit-button" disabled={busy || resetCode.length !== 6}>{busy ? 'Please wait...' : 'Reset password'} <ArrowRight size={16} /></button>
+        <button type="button" className="resend-code" disabled={busy} onClick={requestPasswordReset}>Send a new reset code</button>
+        <button type="button" className="resend-code" disabled={busy} onClick={() => { setForgotMode(false); setResetCodeSent(false); setResetCode(''); setNewPassword(''); setMessage(''); setError(''); }}>Back to sign in</button>
+      </form> : <form onSubmit={(event) => { event.preventDefault(); requestPasswordReset(); }} className="form-stack">
+        <label>NITW student email<input autoComplete="email" type="email" required placeholder="name@student.nitw.ac.in" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} /></label>
+        <button className="button button-dark submit-button" disabled={busy}>{busy ? 'Please wait...' : 'Send reset code'} <ArrowRight size={16} /></button>
+        <button type="button" className="resend-code" onClick={() => { setForgotMode(false); setMessage(''); setError(''); }}>Back to sign in</button>
       </form> : !message && <form onSubmit={submit} className="form-stack">
         {mode === 'signup' && <label>Your name<input autoComplete="name" required minLength="2" maxLength="100" placeholder="e.g. Ananya Rao" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></label>}
         <label>NITW student email<input autoComplete="email" type="email" required placeholder="name@student.nitw.ac.in" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} /></label>
         <label>Password<input autoComplete={mode === 'login' ? 'current-password' : 'new-password'} type="password" minLength="8" required placeholder="At least 8 characters" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} /></label>
         {mode === 'signup' && <div className="domain-hint"><ShieldCheck size={15} /> A 6-digit code will be sent to your student inbox.</div>}
         <button className="button button-dark submit-button" disabled={busy}>{busy ? 'Please wait...' : mode === 'login' ? 'Sign in' : 'Create my account'} <ArrowRight size={16} /></button>
+        {mode === 'login' && <button type="button" className="resend-code" onClick={() => { setForgotMode(true); setResetCodeSent(false); setMessage(''); setError(''); }}>Forgot password?</button>}
       </form>}
+      {message && !verificationPending && !forgotMode && mode === 'login' && <button type="button" className="resend-code" onClick={() => setMessage('')}>Continue to sign in</button>}
       <div className="modal-footnote"><LockKeyhole size={13} /> Your student email stays private.</div>
     </section>
   </div>;
